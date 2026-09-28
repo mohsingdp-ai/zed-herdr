@@ -66,12 +66,42 @@ static int watch_focus_mode(const char *buf, ssize_t n) {
 // ponytail: shrinking Zed while using it waits for a keystroke there.
 // Also drops degenerate/collapsed sizes (e.g. cols=2 from inactive Zed
 // threads) so they don't squish the agent.
-// $CZR_SIZE_FILE ("cols rows", written by the shell watcher while herdr's
-// window is focused) wins over all that: herdr then shows the agent full size.
+// $CZR_SIZE_FILE ("cols rows", written by czr-herdr-focus when herdr's
+// window gains focus or is resized) wins over all that until Zed is used
+// again: herdr then shows the agent full size.
+static void apply_size(int master_fd, int *dropped, int force);
 static int g_hold = 0;  // a shrink is waiting for Zed input
 static int g_herdr = 0; // the pane has herdr's size from the size file
+static const char *g_hook; // $CZR_FOCUS_HOOK: we wrap herdr's own client
+
+// herdr-client mode: run the hook (arg "focus" or "resize") without waiting.
+static void run_hook(const char *why) {
+    if (fork() == 0) {
+        sigset_t none;
+        sigemptyset(&none);
+        sigprocmask(SIG_SETMASK, &none, NULL);  // we block these for signalfd
+        setsid();
+        execl("/bin/sh", "sh", "-c", "exec \"$0\" \"$1\" </dev/null >/dev/null 2>&1", g_hook, why, (char *)NULL);
+        _exit(127);
+    }
+}
+
+// Zed side: typing or focusing Zed's terminal takes the pane back from herdr.
+static void leave_herdr(int master_fd, int *dropped) {
+    const char *path = getenv("CZR_SIZE_FILE");
+    FILE *f = path ? fopen(path, "w") : NULL;
+    if (f) fclose(f);
+    apply_size(master_fd, dropped, 1);
+}
+
 static void apply_size(int master_fd, int *dropped, int force) {
     struct winsize ws, cur;
+    if (g_hook) {
+        // herdr's client: pass every size straight through.
+        if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0) ioctl(master_fd, TIOCSWINSZ, &ws);
+        if (g_focused) run_hook("resize");
+        return;
+    }
     const char *path = getenv("CZR_SIZE_FILE");
     FILE *f = path ? fopen(path, "r") : NULL;
     int cols = 0, rows = 0;
@@ -115,7 +145,10 @@ static void apply_size(int master_fd, int *dropped, int force) {
     ioctl(master_fd, TIOCSWINSZ, &ws);
 }
 
+static char g_pidfile[4096];
+
 static void restore_terminal(void) {
+    if (g_pidfile[0]) unlink(g_pidfile), g_pidfile[0] = 0;
     if (g_termios_saved) {
         write(STDOUT_FILENO, "\x1b[?1004l", 8);
         tcsetattr(STDIN_FILENO, TCSANOW, &g_orig_termios);
@@ -133,6 +166,14 @@ int main(int argc, char *argv[]) {
         execvp(argv[1], &argv[1]);
         perror("execvp");
         return 1;
+    }
+
+    g_hook = getenv("CZR_FOCUS_HOOK");
+    const char *sizefile = getenv("CZR_SIZE_FILE");
+    if (!g_hook && sizefile) {
+        snprintf(g_pidfile, sizeof g_pidfile, "%s.pid", sizefile);
+        FILE *pf = fopen(g_pidfile, "w");
+        if (pf) fprintf(pf, "%d", (int)getpid()), fclose(pf);
     }
 
     if (tcgetattr(STDIN_FILENO, &g_orig_termios) == 0) {
@@ -276,7 +317,13 @@ int main(int argc, char *argv[]) {
             ssize_t n = got > 0 ? take_focus(buf, got, &changed) : got;
             // Typing or clicking into Zed's terminal (or it gaining focus
             // inside Zed) applies a held shrink.
-            if (g_hold && ((changed && g_focused) || n > 0)) apply_size(master_fd, &dropped, 1);
+            if (g_hook) {
+                if (changed && g_focused) run_hook("focus");
+            } else if (g_herdr && ((changed && g_focused) || n > 0)) {
+                leave_herdr(master_fd, &dropped);
+            } else if (g_hold && ((changed && g_focused) || n > 0)) {
+                apply_size(master_fd, &dropped, 1);
+            }
             if (n > 0) {
                 ssize_t written = 0;
                 while (written < n) {

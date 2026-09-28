@@ -16,7 +16,7 @@ _czr_in_zed() {
 }
 
 _czr_herdr() {
-  herdr ${CZR_HERDR_SESSION:+--session "$CZR_HERDR_SESSION"} "$@"
+  command herdr ${CZR_HERDR_SESSION:+--session "$CZR_HERDR_SESSION"} "$@"
 }
 
 _czr_pty_guard() {
@@ -33,6 +33,18 @@ _czr_pty_guard() {
     "$bin" herdr ${CZR_HERDR_SESSION:+--session "$CZR_HERDR_SESSION"} "$@"
   else
     _czr_herdr "$@"
+  fi
+}
+
+herdr() {
+  # A plain `herdr` (the TUI, outside Zed and Herdr) runs inside czr-pty-guard,
+  # which sees its terminal's focus-in and resize events and then gives every
+  # agent also shown in Zed herdr's pane size (czr-herdr-focus). Event driven
+  # and works in any terminal with focus reporting. Everything else is as usual.
+  if [[ $# -eq 0 && -z ${HERDR_ENV:-} ]] && ! _czr_in_zed; then
+    CZR_FOCUS_HOOK=${BASH_SOURCE[0]%/*}/czr-herdr-focus _czr_pty_guard
+  else
+    command herdr "$@"
   fi
 }
 
@@ -114,28 +126,6 @@ _czr_sync_name() {
   [[ -n $tab ]] && _czr_herdr tab rename "$tab" "$want" >/dev/null && tabbed=$want
 }
 
-_czr_sync_size() {
-  # pane - called each _czr_herdr_watch tick. One pane has one size, so it
-  # follows the window in use: Zed focused -> Zed's size; any other window
-  # focused -> the pane's size in herdr's own window. Written to the file
-  # czr-pty-guard reads on SIGUSR2. Uses _czr_herdr_watch's sfile/ssize/scls/stick.
-  # ponytail: Hyprland only (hyprctl); elsewhere Zed keeps the size.
-  local cls want="" gp
-  command -v hyprctl >/dev/null || return
-  cls=$(hyprctl activewindow 2>/dev/null | sed -n 's/^\tclass: //p')
-  if [[ $cls != dev.zed.Zed ]]; then
-    # herdr's window can be resized too: re-read its size every 5th tick.
-    [[ $cls != "$scls" ]] || (( ++stick % 5 == 0 )) || return
-    want=$(_czr_herdr pane layout --pane "$1" | jq -r --arg p "$1" \
-      '.result.layout.panes[] | select(.pane_id == $p) | "\(.rect.width) \(.rect.height)"')
-  fi
-  scls=$cls
-  [[ $want != "$ssize" ]] || return
-  gp=$(pgrep -xf "$CZR_STATE/bin/czr-pty-guard herdr .*agent attach $1") || return
-  printf '%s' "$want" >"$sfile"
-  kill -USR2 $gp && ssize=$want
-}
-
 _czr_herdr_watch() {
   # pane tty shell-pid shell-start zed-pid zed-start
   # One background helper per attached agent (was two: title + reaper). Runs in
@@ -162,7 +152,7 @@ _czr_herdr_watch() {
   local db=${CZR_ZED_DB:-~/.local/share/zed/db/0-stable/db.sqlite} prev="" now i gone=0 tid="" named="" tab="" tabbed=""
   local q="select terminal_id from sidebar_terminal_threads" tick=0 t
   local sock status="" title="" agent="" line ev g cur rc shown="" fi=0
-  local sfile=$CZR_STATE/size.${1//:/_} ssize="" scls="" stick=0
+  local sfile=$CZR_STATE/size.${1//:/_}
   SUB_PID=""  # set by coproc; not local, coproc assigns it globally
   local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)  # braille spinner while working
   local tfile=$CZR_STATE/title.${1//:/_}

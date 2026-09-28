@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# focus|resize - run by czr-pty-guard around herdr's own client when herdr's
+# window gains focus or is resized. Every agent also shown in a Zed terminal
+# takes its herdr pane size (czr-pty-guard reads the size file on SIGUSR2);
+# typing in Zed takes it back.
+st=${XDG_STATE_HOME:-~/.local/state}/zed-herdr
+[[ $1 == resize ]] && sleep 0.1  # let herdr lay out the new size first
+for pf in "$st"/size.*.pid; do
+  [[ -e $pf ]] || continue
+  pid=$(<"$pf")
+  # A guard killed hard leaves its pid file: never signal a reused pid.
+  [[ $(tr '\0' ' ' </proc/$pid/cmdline 2>/dev/null) == *czr-pty-guard* ]] || { rm -f "$pf"; continue; }
+  f=${pf%.pid} p=${pf##*/size.}
+  p=${p%.pid} p=${p/_/:}
+  size=$(herdr pane layout --pane "$p" | jq -r --arg p "$p" \
+    '.result.layout.panes[] | select(.pane_id == $p) | "\(.rect.width) \(.rect.height)"') || continue
+  [[ -n $size ]] || continue
+  printf '%s' "$size" >"$f"
+  kill -USR2 "$pid"
+done
