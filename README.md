@@ -8,7 +8,7 @@ This extension gives Zed's Agent panel a `herdr` MCP server that drives the real
 - `herdr_status` — workspaces, tabs, panes, git branch, agent status
 - `herdr_workspace_create`, `herdr_tab_create` — create workspace / tab
 - `herdr_pane_split`, `herdr_close`, `herdr_focus` — manage panes
-- `herdr_agent_launch` — launch Claude Code, Codex, ...
+- `herdr_agent_launch` — launch any agent herdr supports (claude, codex, gemini, opencode, cursor, amp, ...)
 - `herdr_agent_prompt`, `herdr_read`, `herdr_agent_keys` — talk to agents
 
 Stateless: every call reads live state. Agents run in Herdr, so they outlive Zed.

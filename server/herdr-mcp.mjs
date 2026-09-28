@@ -117,9 +117,9 @@ const tools = {
   },
   herdr_agent_launch: {
     description:
-      "Start a coding agent (claude, codex, opencode, gemini, ...) in Herdr. Uses the given shell pane, else a new tab in `workspace`, else a new workspace. The agent keeps running in Herdr after Zed exits.",
+      "Start any coding agent Herdr supports in Herdr. Uses the given shell pane, else a new tab in `workspace`, else a new workspace. The agent keeps running in Herdr after Zed exits.",
     schema: {
-      kind: str("Agent kind: claude, codex, opencode, gemini, cursor, amp, ..."),
+      kind: str("Agent kind (herdr 0.9.1): pi, claude, codex, gemini, cursor, devin, agy, cline, omp, mastracode, opencode, copilot, kimi, kiro, droid, amp, grok, hermes, kilo, qodercli, qwen, letta, maki, muse"),
       name: str("Unique agent name matching [a-z][a-z0-9_-]{0,31}"),
       pane: str("Existing idle shell pane id"),
       workspace: str("Workspace id to add a tab to when no pane is given"),
