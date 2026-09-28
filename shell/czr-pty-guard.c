@@ -66,9 +66,28 @@ static int watch_focus_mode(const char *buf, ssize_t n) {
 // ponytail: shrinking Zed while using it waits for a keystroke there.
 // Also drops degenerate/collapsed sizes (e.g. cols=2 from inactive Zed
 // threads) so they don't squish the agent.
+// $CZR_SIZE_FILE ("cols rows", written by the shell watcher while herdr's
+// window is focused) wins over all that: herdr then shows the agent full size.
 static int g_hold = 0;  // a shrink is waiting for Zed input
+static int g_herdr = 0; // the pane has herdr's size from the size file
 static void apply_size(int master_fd, int *dropped, int force) {
     struct winsize ws, cur;
+    const char *path = getenv("CZR_SIZE_FILE");
+    FILE *f = path ? fopen(path, "r") : NULL;
+    int cols = 0, rows = 0;
+    if (f) {
+        if (fscanf(f, "%d %d", &cols, &rows) != 2) cols = rows = 0;
+        fclose(f);
+    }
+    if (cols >= MIN_COLS && rows >= MIN_ROWS) {
+        struct winsize other = {.ws_row = rows, .ws_col = cols};
+        ioctl(master_fd, TIOCSWINSZ, &other);
+        g_herdr = 1;
+        g_hold = 0;
+        *dropped = 1;  // Zed's screen is stale now: redraw on return
+        return;
+    }
+    if (g_herdr) force = 1, g_herdr = 0;  // back to Zed: take its size at once
     if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) != 0) return;
     if (ws.ws_col < MIN_COLS || ws.ws_row < MIN_ROWS) {
         // Zed cuts its screen to that size, so it must be redrawn later.
@@ -146,6 +165,7 @@ int main(int argc, char *argv[]) {
     sigaddset(&mask, SIGTERM);
     sigaddset(&mask, SIGHUP);
     sigaddset(&mask, SIGINT);
+    sigaddset(&mask, SIGUSR2);  // size file changed
     if (sigprocmask(SIG_BLOCK, &mask, &orig_mask) < 0) {
         perror("sigprocmask");
         return 1;
@@ -205,6 +225,7 @@ int main(int argc, char *argv[]) {
     int child_exited = 0;
     int child_status = 0;
     int dropped = 0;
+    apply_size(master_fd, &dropped, 0);  // size file may predate us
 
     while (1) {
         pfds[0].fd = STDIN_FILENO;
@@ -229,7 +250,7 @@ int main(int argc, char *argv[]) {
         if (pfds[2].revents & POLLIN) {
             struct signalfd_siginfo fdsi;
             while (read(sfd, &fdsi, sizeof(fdsi)) == sizeof(fdsi)) {
-                if (fdsi.ssi_signo == SIGWINCH) {
+                if (fdsi.ssi_signo == SIGWINCH || fdsi.ssi_signo == SIGUSR2) {
                     apply_size(master_fd, &dropped, 0);
                 } else if (fdsi.ssi_signo == SIGCHLD) {
                     pid_t p;
