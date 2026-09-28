@@ -13,35 +13,75 @@
 #include <termios.h>
 #include <unistd.h>
 
-#define MIN_COLS 10
-#define MIN_ROWS 4
+#define MIN_COLS 40
+#define MIN_ROWS 10
 
 static struct termios g_orig_termios;
 static int g_termios_saved = 0;
+static int g_focused = 1;      // Zed's terminal has focus
+static int g_inner_focus = 0;  // the agent asked for focus reports itself
 
-// Sets the inner pane size. $CZR_SIZE_FILE ("cols rows", written by the shell
-// hook when another window than Zed is focused) wins; otherwise Zed's size.
-static void apply_size(int master_fd, int *dropped) {
-    struct winsize ws;
-    int zed_ok = ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0 &&
-                 ws.ws_col >= MIN_COLS && ws.ws_row >= MIN_ROWS;
-    // Drop degenerate/collapsed sizes (e.g. cols=2 from inactive Zed threads).
-    // Zed cuts its screen to that size, so it must be redrawn later.
-    if (!zed_ok) *dropped = 1;
-
-    const char *path = getenv("CZR_SIZE_FILE");
-    FILE *f = path ? fopen(path, "r") : NULL;
-    int cols = 0, rows = 0;
-    if (f) {
-        if (fscanf(f, "%d %d", &cols, &rows) != 2) cols = rows = 0;
-        fclose(f);
+// Zed reports focus as ESC [ I / ESC [ O (mode 1004, enabled in main). Track it,
+// and pass it on only if the agent asked for focus reports too.
+// ponytail: a report split across two reads is missed; the next one fixes it.
+static ssize_t take_focus(char *buf, ssize_t n, int *changed) {
+    ssize_t o = 0;
+    for (ssize_t i = 0; i < n; i++) {
+        if (i + 2 < n && buf[i] == '\x1b' && buf[i + 1] == '[' && (buf[i + 2] == 'I' || buf[i + 2] == 'O')) {
+            int f = buf[i + 2] == 'I';
+            if (f != g_focused) {
+                g_focused = f;
+                *changed = 1;
+            }
+            if (!g_inner_focus) {
+                i += 2;
+                continue;
+            }
+        }
+        buf[o++] = buf[i];
     }
-    if (cols >= MIN_COLS && rows >= MIN_ROWS) {
-        struct winsize other = {.ws_row = rows, .ws_col = cols};
-        ioctl(master_fd, TIOCSWINSZ, &other);
+    return o;
+}
+
+// Notes the agent turning focus reports on/off; returns 1 if it turned them
+// off, so the caller turns them back on in Zed (the guard still needs them).
+// ponytail: combined modes ("ESC [?1004;2004h") aren't parsed.
+static int watch_focus_mode(const char *buf, ssize_t n) {
+    static const char pat[] = "\x1b[?1004";
+    const size_t len = sizeof pat - 1;
+    const char *p = buf, *end = buf + n;
+    int off = 0;
+    while ((p = memmem(p, end - p, pat, len)) && p + len < end) {
+        if (p[len] == 'h') g_inner_focus = 1;
+        if (p[len] == 'l') g_inner_focus = 0, off = 1;
+        p += len;
+    }
+    return off;
+}
+
+// Passes Zed's size to the pane. A shrink waits for Zed input (force): Zed
+// shrinks when you switch to herdr's window (e.g. un-fullscreen), and herdr
+// would then show the agent that small. Zed's focus reports don't help: it
+// sends none when its whole window loses focus. Growing applies at once.
+// ponytail: shrinking Zed while using it waits for a keystroke there.
+// Also drops degenerate/collapsed sizes (e.g. cols=2 from inactive Zed
+// threads) so they don't squish the agent.
+static int g_hold = 0;  // a shrink is waiting for Zed input
+static void apply_size(int master_fd, int *dropped, int force) {
+    struct winsize ws, cur;
+    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) != 0) return;
+    if (ws.ws_col < MIN_COLS || ws.ws_row < MIN_ROWS) {
+        // Zed cuts its screen to that size, so it must be redrawn later.
+        *dropped = 1;
         return;
     }
-    if (!zed_ok) return;
+    if (!force && ioctl(master_fd, TIOCGWINSZ, &cur) == 0 &&
+        (ws.ws_col < cur.ws_col || ws.ws_row < cur.ws_row)) {
+        g_hold = 1;
+        *dropped = 1;  // Zed now shows the old frame cut: redraw later
+        return;
+    }
+    g_hold = 0;
     if (*dropped) {
         // Back at the old size the kernel sends no SIGWINCH and the agent
         // never repaints: nudge one column first to force it.
@@ -56,6 +96,7 @@ static void apply_size(int master_fd, int *dropped) {
 
 static void restore_terminal(void) {
     if (g_termios_saved) {
+        write(STDOUT_FILENO, "\x1b[?1004l", 8);
         tcsetattr(STDIN_FILENO, TCSANOW, &g_orig_termios);
         g_termios_saved = 0;
     }
@@ -105,7 +146,6 @@ int main(int argc, char *argv[]) {
     sigaddset(&mask, SIGTERM);
     sigaddset(&mask, SIGHUP);
     sigaddset(&mask, SIGINT);
-    sigaddset(&mask, SIGUSR2);  // size file changed
     if (sigprocmask(SIG_BLOCK, &mask, &orig_mask) < 0) {
         perror("sigprocmask");
         return 1;
@@ -154,6 +194,7 @@ int main(int argc, char *argv[]) {
     struct termios raw = g_orig_termios;
     cfmakeraw(&raw);
     tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+    write(STDOUT_FILENO, "\x1b[?1004h", 8);  // ask Zed for focus reports
 
     // Set non-blocking on master_fd
     int flags = fcntl(master_fd, F_GETFL, 0);
@@ -164,7 +205,6 @@ int main(int argc, char *argv[]) {
     int child_exited = 0;
     int child_status = 0;
     int dropped = 0;
-    apply_size(master_fd, &dropped);  // size file may predate us
 
     while (1) {
         pfds[0].fd = STDIN_FILENO;
@@ -189,8 +229,8 @@ int main(int argc, char *argv[]) {
         if (pfds[2].revents & POLLIN) {
             struct signalfd_siginfo fdsi;
             while (read(sfd, &fdsi, sizeof(fdsi)) == sizeof(fdsi)) {
-                if (fdsi.ssi_signo == SIGWINCH || fdsi.ssi_signo == SIGUSR2) {
-                    apply_size(master_fd, &dropped);
+                if (fdsi.ssi_signo == SIGWINCH) {
+                    apply_size(master_fd, &dropped, 0);
                 } else if (fdsi.ssi_signo == SIGCHLD) {
                     pid_t p;
                     int status;
@@ -208,7 +248,12 @@ int main(int argc, char *argv[]) {
 
         // Handle stdin -> master_fd
         if (pfds[0].revents & POLLIN) {
-            ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+            ssize_t got = read(STDIN_FILENO, buf, sizeof(buf));
+            int changed = 0;
+            ssize_t n = got > 0 ? take_focus(buf, got, &changed) : got;
+            // Typing or clicking into Zed's terminal (or it gaining focus
+            // inside Zed) applies a held shrink.
+            if (g_hold && ((changed && g_focused) || n > 0)) apply_size(master_fd, &dropped, 1);
             if (n > 0) {
                 ssize_t written = 0;
                 while (written < n) {
@@ -222,7 +267,7 @@ int main(int argc, char *argv[]) {
                     }
                     written += w;
                 }
-            } else if (n == 0) {
+            } else if (got == 0) {
                 // Stdin EOF (e.g. thread closed)
                 close(master_fd);
                 break;
@@ -245,6 +290,7 @@ int main(int argc, char *argv[]) {
                     }
                     written += w;
                 }
+                if (watch_focus_mode(buf, n)) write(STDOUT_FILENO, "\x1b[?1004h", 8);
             } else if (n <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                 // Master closed
                 break;
