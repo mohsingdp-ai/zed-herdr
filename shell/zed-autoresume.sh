@@ -298,13 +298,51 @@ _czr_herdr_attach() {
   wp=$( ( setsid bash -c 'source "$0"; _czr_herdr_watch "$@"' "${BASH_SOURCE[0]}" \
     "$1" "$t" $$ "$(_czr_starttime $$)" "$zpid" "${zpid:+$(_czr_starttime "$zpid")}" \
     </dev/null >/dev/null 2>&1 & echo $! ) )
-  CZR_SIZE_FILE=$CZR_STATE/size.${1//:/_} _czr_pty_guard agent attach "$1"
+  if _czr_sidebar_ok "$1"; then
+    _czr_sidebar "$1"
+  else
+    CZR_SIZE_FILE=$CZR_STATE/size.${1//:/_} _czr_pty_guard agent attach "$1"
+  fi
   rc=$?
   # Keep the close watch if the pane still exists: attach can exit a moment before
   # the shell when the thread is being closed. The title stops either way.
   if _czr_herdr pane get "$1" >/dev/null 2>&1; then kill -USR1 "$wp"; else kill "$wp"; fi 2>/dev/null
   rm -rf "$CZR_STATE/claims/${1//:/_}"
   return "$rc"
+}
+
+_czr_sidebar_ok() {
+  # pane - Claude Code has no side panel; claude-sidebar (context, cost, limits,
+  # like OpenCode's) can be shown next to it. Claude only, wide terminals only,
+  # not inside tmux. CZR_SIDEBAR=0 disables it.
+  local cols
+  [[ ${CZR_SIDEBAR:-1} != 0 && -z ${TMUX:-} ]] && command -v tmux >/dev/null && command -v claude-sidebar >/dev/null || return 1
+  read -r _ cols < <(stty size </dev/tty 2>/dev/null)
+  (( ${cols:-0} >= 110 )) || return 1
+  [[ $(_czr_herdr agent get "$1" 2>/dev/null | jq -r '.result.agent.agent // empty') == claude ]]
+}
+
+_czr_sidebar() {
+  # pane - the attach, with claude-sidebar in a 32-column strip on its right.
+  # tmux does the split: own server (-L czr), no config, no prefix key or status
+  # bar, so keys go straight through. A click goes to the pane under it (the
+  # sidebar opens the clicked agent) but keyboard focus stays on the agent.
+  # The session ends with the attach, and
+  # with the Zed terminal (destroy-unattached), so no attach is left behind.
+  # ponytail: tmux sits between Zed and herdr; drop it if herdr's attach gains a side pane.
+  local name=czr-${1//:/_}
+  tmux -L czr kill-session -t "$name" 2>/dev/null
+  tmux -L czr -f /dev/null new-session -s "$name" \
+    env CZR_SIZE_FILE="$CZR_STATE/size.${1//:/_}" CZR_HERDR_SESSION="${CZR_HERDR_SESSION:-}" \
+    bash -c 'source "$0"; _czr_pty_guard agent attach "$1"; tmux -L czr kill-session -t "$2"' \
+    "${BASH_SOURCE[0]}" "$1" "$name" \; \
+    set destroy-unattached on \; set status off \; set prefix None \; set mouse on \; \
+    set -g default-terminal tmux-256color \; set -g focus-events on \; \
+    set -s escape-time 0 \; set -s extended-keys on \; set -s set-clipboard on \; \
+    set -as terminal-features ',*:RGB:extkeys:clipboard:focus' \; \
+    bind -n MouseDown1Pane send-keys -M \; \
+    set-hook window-layout-changed 'resize-pane -t :.1 -x 32' \; \
+    split-window -h -d -l 32 claude-sidebar "pane-$1"
 }
 
 _czr_ppid() {
