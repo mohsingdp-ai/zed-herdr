@@ -19,6 +19,23 @@ _czr_herdr() {
   herdr ${CZR_HERDR_SESSION:+--session "$CZR_HERDR_SESSION"} "$@"
 }
 
+_czr_pty_guard() {
+  # Wrap herdr attach in a pty guard that drops collapsed/dummy resize events
+  # (e.g. cols=2 from inactive or hidden Zed sidebar threads), preventing them
+  # from squishing the Herdr pane when viewed in full screen.
+  local bin=$CZR_STATE/bin/czr-pty-guard
+  local src=${BASH_SOURCE[0]%/*}/czr-pty-guard.c
+  if [[ -f $src && ( ! -x $bin || $src -nt $bin ) ]] && command -v gcc >/dev/null; then
+    mkdir -p "${bin%/*}"
+    gcc -O2 "$src" -o "$bin" 2>/dev/null
+  fi
+  if [[ -x $bin ]]; then
+    "$bin" herdr ${CZR_HERDR_SESSION:+--session "$CZR_HERDR_SESSION"} "$@"
+  else
+    _czr_herdr "$@"
+  fi
+}
+
 _czr_project() {
   # Zed project root this shell belongs to: the longest Zed project folder that
   # is $PWD or a parent of it. Falls back to $PWD.
@@ -55,80 +72,13 @@ _czr_herdr_start() {
   echo "$pane"
 }
 
-_czr_herdr_title() {
-  # pane tty - mirror Herdr's agent status into this terminal's title, which is
-  # what Zed's sidebar shows as the thread name. Herdr's attach doesn't forward
-  # titles, so this listens to the server's own push stream (events.subscribe on
-  # the session socket, same events Herdr's clients render from). No polling.
-  # While the agent works the title is just a spinning braille spinner + the
-  # task title, advancing on read timeouts, so the Zed sidebar
-  # name spins. Other states keep the "<glyph> <status> · <task>" form.
-  # ponytail: writes the tty alongside attach; a write can land mid-frame
-  # (one-frame glitch). Upgrade: Herdr forwarding titles to attach clients.
-  local sock status title agent line ev g cur rc shown="" fi=0
-  local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)  # braille spinner while working
-  exec </dev/null 2>/dev/null
-  command -v socat >/dev/null || return
-  sock=$(herdr session list --json | jq -r --arg s "${CZR_HERDR_SESSION:-}" \
-    'first(.sessions[] | select(if $s == "" then .default else .name == $s end)) | .socket_path')
-  [[ -S $sock ]] || return
-  coproc SUB { socat - "UNIX-CONNECT:$sock"; }
-  trap 'kill "$SUB_PID" 2>/dev/null; exit' TERM
-  jq -nc --arg p "$1" '{id: "zed-title", method: "events.subscribe", params: {subscriptions: [
-    {type: "pane.agent_status_changed", pane_id: $p}, {type: "pane.updated"}, {type: "pane.closed"}]}}' >&"${SUB[1]}"
-  # Subscribe first, then read current state, so no change falls in between.
-  IFS=$'\t' read -r status agent title < <(_czr_herdr agent get "$1" |
-    jq -r '.result.agent | [.agent_status, .agent // "agent", .terminal_title_stripped // ""] | @tsv')
-  while :; do
-    case $status in
-      working) g=${frames[fi]} ;;
-      blocked) g=✘ ;;  # heavy ballot X: the ✗ cross, bold
-      done) g=✓ ;;
-      idle) g=◯ ;;  # large circle: the ○, bigger
-      *) g=· ;;
-    esac
-    if [[ $status == working ]]; then
-      cur="$g ${title:-$agent}"  # spinner instead of the word "working"
-    else
-      cur="$g ${status:-unknown} · ${title:-$agent}"
-    fi
-    [[ $cur == "$shown" ]] || printf '\e]0;%s\a' "$cur" >"$2"
-    # The reaper finds this thread's Zed row by it (Zed stores it as the title).
-    [[ $cur == "$shown" ]] || printf '%s' "$cur" >"$CZR_STATE/title.${1//:/_}"
-    shown=$cur
-    if [[ $status == working ]]; then
-      IFS= read -t 0.2 -r line <&"${SUB[0]}"; rc=$?
-      if (( rc > 128 )); then
-        fi=$(( (fi + 1) % ${#frames[@]} ))
-        continue
-      fi
-    else
-      IFS= read -r line <&"${SUB[0]}"; rc=$?
-    fi
-    (( rc == 0 )) || break
-    ev=$(jq -r --arg p "$1" '
-      if .error then "x"
-      elif .data.pane.pane_id == $p then "t\t\(.data.pane.terminal_title_stripped // "")"
-      elif .data.pane_id == $p and .data.agent_status then "s\t\(.data.agent_status)"
-      elif .data.pane_id == $p and (.event | test("closed")) then "x"
-      else "-" end' <<<"$line")
-    case $ev in
-      t$'\t'*) title=${ev#t$'\t'} ;;
-      s$'\t'*) status=${ev#s$'\t'}; fi=0 ;;
-      x) break ;;
-    esac
-  done
-  kill "$SUB_PID" 2>/dev/null
-  rm -f "$CZR_STATE/title.${1//:/_}"
-}
-
 _czr_sync_name() {
-  # pane - called each reaper tick. Finds this thread's Zed row (the one whose
-  # title matches what _czr_herdr_title wrote, ignoring the animated first glyph),
+  # pane - called each _czr_herdr_watch tick. Finds this thread's Zed row (the one whose
+  # title matches what _czr_herdr_watch wrote, ignoring the animated first glyph),
   # copies a rename done in
   # Zed (custom_title) onto the Herdr pane, and names the Herdr tab what Zed
   # shows: that rename, else the agent's task title. Herdr notifications name
-  # the tab, so they then match the Zed thread. Uses reaper's db/tid/named/tab/tabbed.
+  # the tab, so they then match the Zed thread. Uses _czr_herdr_watch's db/tid/named/tab/tabbed.
   local t ct want
   t=$(cat "$CZR_STATE/title.${1//:/_}" 2>/dev/null)
   if [[ -z $tid && -n $t ]]; then
@@ -158,32 +108,133 @@ _czr_sync_name() {
   [[ -n $tab ]] && _czr_herdr tab rename "$tab" "$want" >/dev/null && tabbed=$want
 }
 
-_czr_herdr_reaper() {
-  # pane shell-pid shell-start zed-pid zed-start title-pid
-  # Clicking x on a Zed thread deletes its row from Zed's sidebar DB and kills
-  # its shell together (measured: same 50ms tick): close the Herdr pane at once.
-  # Zed quit/restart kills shells but keeps the rows, so the agent keeps running
-  # in Herdr. Anything unclear keeps the agent.
+_czr_sync_size() {
+  # pane - called each _czr_herdr_watch tick. One pane has one size, so it
+  # follows the window in use: Zed focused -> Zed's size; any other window
+  # focused -> the pane's size in herdr's own window. Written to the file
+  # czr-pty-guard reads on SIGUSR2. Uses _czr_herdr_watch's sfile/ssize/scls/stick.
+  # ponytail: Hyprland only (hyprctl); elsewhere Zed keeps the size.
+  local cls want="" gp
+  command -v hyprctl >/dev/null || return
+  cls=$(hyprctl activewindow 2>/dev/null | sed -n 's/^\tclass: //p')
+  if [[ $cls != dev.zed.Zed ]]; then
+    # herdr's window can be resized too: re-read its size every 5th tick.
+    [[ $cls != "$scls" ]] || (( ++stick % 5 == 0 )) || return
+    want=$(_czr_herdr pane layout --pane "$1" | jq -r --arg p "$1" \
+      '.result.layout.panes[] | select(.pane_id == $p) | "\(.rect.width) \(.rect.height)"')
+  fi
+  scls=$cls
+  [[ $want != "$ssize" ]] || return
+  gp=$(pgrep -xf "$CZR_STATE/bin/czr-pty-guard herdr .*agent attach $1") || return
+  printf '%s' "$want" >"$sfile"
+  kill -USR2 $gp && ssize=$want
+}
+
+_czr_herdr_watch() {
+  # pane tty shell-pid shell-start zed-pid zed-start
+  # One background helper per attached agent (was two: title + reaper). Runs in
+  # its own session, so it survives the hangup that kills the shell.
+  #
+  # Title: mirror Herdr's agent status into the tty's title, which is what Zed's
+  # sidebar shows as the thread name. Herdr's attach doesn't forward titles, so
+  # this listens to the server's own push stream (events.subscribe on the session
+  # socket, same events Herdr's clients render from). While the agent works the
+  # title is a spinning braille spinner + the task title; other states show
+  # "<glyph> <status> · <task>". USR1 (sent when attach ends) stops the title.
+  # ponytail: writes the tty alongside attach; a write can land mid-frame
+  # (one-frame glitch). Upgrade: Herdr forwarding titles to attach clients.
+  #
+  # Close: clicking x on a Zed thread deletes its row from Zed's sidebar DB and
+  # kills its shell together (measured: same 50ms tick): close the Herdr pane at
+  # once. Zed quit/restart kills shells but keeps the rows, so the agent keeps
+  # running in Herdr. Anything unclear keeps the agent.
   # ponytail: "a row vanished as our shell died" = our thread; a different thread
   # closed in that same instant would be taken as ours. Upgrade: Zed exposing its
   # terminal id to the shell.
   trap '' HUP
   exec >/dev/null 2>&1 </dev/null
   local db=${CZR_ZED_DB:-~/.local/share/zed/db/0-stable/db.sqlite} prev="" now i gone=0 tid="" named="" tab="" tabbed=""
-  local q="select terminal_id from sidebar_terminal_threads"
+  local q="select terminal_id from sidebar_terminal_threads" tick=0 t
+  local sock status="" title="" agent="" line ev g cur rc shown="" fi=0
+  local sfile=$CZR_STATE/size.${1//:/_} ssize="" scls="" stick=0
+  SUB_PID=""  # set by coproc; not local, coproc assigns it globally
+  local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)  # braille spinner while working
+  local tfile=$CZR_STATE/title.${1//:/_}
   _czr_rows_vanished() { now=$(sqlite3 -readonly "$db" "$q") && [[ -n $prev ]] && grep -qvxF -f <(printf '%s\n' "$now") <<<"$prev"; }
+  _czr_title_stop() { [[ -n $SUB_PID ]] && kill "$SUB_PID"; SUB_PID=""; rm -f "$tfile"; }
+  trap _czr_title_stop USR1
+  trap '_czr_title_stop; exit' TERM
+  if [[ -n $2 ]] && command -v socat >/dev/null; then
+    sock=$(herdr session list --json | jq -r --arg s "${CZR_HERDR_SESSION:-}" \
+      'first(.sessions[] | select(if $s == "" then .default else .name == $s end)) | .socket_path')
+    if [[ -S $sock ]]; then
+      coproc SUB { exec socat - "UNIX-CONNECT:$sock"; }
+      jq -nc --arg p "$1" '{id: "zed-title", method: "events.subscribe", params: {subscriptions: [
+        {type: "pane.agent_status_changed", pane_id: $p}, {type: "pane.updated"}, {type: "pane.closed"}]}}' >&"${SUB[1]}"
+      # Subscribe first, then read current state, so no change falls in between.
+      IFS=$'\t' read -r status agent title < <(_czr_herdr agent get "$1" |
+        jq -r '.result.agent | [.agent_status, .agent // "agent", .terminal_title_stripped // ""] | @tsv')
+    fi
+  fi
   # Watch for our shell dying; note when any thread row vanishes (Zed may delete
   # the row a moment before or after it kills the shell).
-  while _czr_alive "$2" "$3"; do
-    _czr_rows_vanished && gone=${EPOCHREALTIME/./}
+  while :; do
+    if [[ -n $SUB_PID ]]; then
+      case $status in
+        working) g=${frames[fi]} ;;
+        blocked) g=✘ ;;  # heavy ballot X: the ✗ cross, bold
+        done) g=✓ ;;
+        idle) g=◯ ;;  # large circle: the ○, bigger
+        *) g=· ;;
+      esac
+      if [[ $status == working ]]; then
+        cur="$g ${title:-$agent}"  # spinner instead of the word "working"
+      else
+        cur="$g ${status:-unknown} · ${title:-$agent}"
+      fi
+      if [[ $cur != "$shown" ]]; then
+        printf '\e]0;%s\a' "$cur" >"$2"
+        # _czr_sync_name finds this thread's Zed row by it (Zed stores it as the title).
+        printf '%s' "$cur" >"$tfile"
+        shown=$cur
+      fi
+      IFS= read -t 0.2 -r line <&"${SUB[0]}"; rc=$?
+      if (( rc > 128 )); then
+        [[ $status == working ]] && fi=$(( (fi + 1) % ${#frames[@]} ))
+      elif (( rc == 0 )); then
+        ev=$(jq -r --arg p "$1" '
+          if .error then "x"
+          elif .data.pane.pane_id == $p then "t\t\(.data.pane.terminal_title_stripped // "")"
+          elif .data.pane_id == $p and .data.agent_status then "s\t\(.data.agent_status)"
+          elif .data.pane_id == $p and (.event | test("closed")) then "x"
+          else "-" end' <<<"$line")
+        case $ev in
+          t$'\t'*) title=${ev#t$'\t'} ;;
+          s$'\t'*) status=${ev#s$'\t'}; fi=0 ;;
+          x) _czr_title_stop ;;
+        esac
+      else
+        _czr_title_stop  # stream ended
+      fi
+    else
+      sleep 0.2
+    fi
+    # Close/rename checks every 0.2s, however busy the event stream is.
+    t=${EPOCHREALTIME/./}
+    (( t - tick >= 200000 )) || continue
+    tick=$t
+    _czr_alive "$3" "$4" || break
+    _czr_rows_vanished && gone=$t
     _czr_sync_name "$1"
+    _czr_sync_size "$1"
     [[ -n ${now+x} ]] && prev=$now
-    sleep 0.2
   done
-  (( ${6:-0} > 1 )) && kill "$6"
+  _czr_title_stop
+  rm -f "$sfile"
+  [[ -n $5 ]] || return
   (( ${EPOCHREALTIME/./} - gone < 3000000 )) && { _czr_herdr pane close "$1"; return; }
   for i in {1..40}; do
-    _czr_alive "$4" "$5" || return
+    _czr_alive "$5" "$6" || return
     _czr_rows_vanished && { _czr_herdr pane close "$1"; return; }
     sleep 0.05
   done
@@ -239,26 +290,24 @@ _czr_restore() {
 
 _czr_herdr_attach() {
   # Wait for Herdr to detect the agent, then show its live terminal here.
-  local i rc tw="" t zpid rp=""
+  local i rc t zpid wp
   mkdir -p "$CZR_STATE"
   _czr_claim "$1"
   for i in {1..40}; do
     _czr_herdr agent get "$1" >/dev/null 2>&1 && break
     sleep 0.25
   done
-  t=$(tty 2>/dev/null) && tw=$( ( _czr_herdr_title "$1" "$t" >/dev/null & echo $! ) )
+  t=$(tty 2>/dev/null)
+  zpid=$(_czr_find_zed)
   # Own session: survives the hangup that kills this shell when the thread closes.
-  if zpid=$(_czr_find_zed); then
-    rp=$( ( setsid bash -c 'source "$0"; _czr_herdr_reaper "$@"' "${BASH_SOURCE[0]}" \
-      "$1" $$ "$(_czr_starttime $$)" "$zpid" "$(_czr_starttime "$zpid")" "${tw:-0}" \
-      </dev/null >/dev/null 2>&1 & echo $! ) )
-  fi
-  _czr_herdr agent attach "$1"
+  wp=$( ( setsid bash -c 'source "$0"; _czr_herdr_watch "$@"' "${BASH_SOURCE[0]}" \
+    "$1" "$t" $$ "$(_czr_starttime $$)" "$zpid" "${zpid:+$(_czr_starttime "$zpid")}" \
+    </dev/null >/dev/null 2>&1 & echo $! ) )
+  CZR_SIZE_FILE=$CZR_STATE/size.${1//:/_} _czr_pty_guard agent attach "$1"
   rc=$?
-  # Keep the reaper if the pane still exists: attach can exit a moment before the
-  # shell when the thread is being closed.
-  [[ -n $rp ]] && ! _czr_herdr pane get "$1" >/dev/null 2>&1 && kill "$rp" 2>/dev/null
-  [[ -n $tw ]] && kill "$tw" 2>/dev/null
+  # Keep the close watch if the pane still exists: attach can exit a moment before
+  # the shell when the thread is being closed. The title stops either way.
+  if _czr_herdr pane get "$1" >/dev/null 2>&1; then kill -USR1 "$wp"; else kill "$wp"; fi 2>/dev/null
   rm -rf "$CZR_STATE/claims/${1//:/_}"
   return "$rc"
 }
