@@ -101,15 +101,17 @@ static void apply_size(int master_fd, int *dropped, int force) {
         return;
     }
     g_hold = 0;
-    if (*dropped) {
+    if (*dropped && ioctl(master_fd, TIOCGWINSZ, &cur) == 0 &&
+        cur.ws_col == ws.ws_col && cur.ws_row == ws.ws_row) {
         // Back at the old size the kernel sends no SIGWINCH and the agent
-        // never repaints: nudge one column first to force it.
+        // never repaints: nudge one column first to force it. A real size
+        // change repaints by itself (a nudge would be a second redraw).
         struct winsize nudge = ws;
         nudge.ws_col--;
         ioctl(master_fd, TIOCSWINSZ, &nudge);
         usleep(50000);
-        *dropped = 0;
     }
+    *dropped = 0;
     ioctl(master_fd, TIOCSWINSZ, &ws);
 }
 

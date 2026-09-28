@@ -68,7 +68,13 @@ _czr_herdr_start() {
   [[ -n $pane && $pane != null ]] || return 1
   # exec: the pane closes when the agent exits, which ends the Zed-side attach.
   printf -v cmd '%q ' "$@"
-  _czr_herdr pane run "$pane" "exec $cmd" >/dev/null || return 1
+  # Start the agent at Zed's size, not herdr's: attach then changes nothing, so
+  # the agent doesn't jump/redraw right after opening. Tiny sizes are skipped
+  # (czr-pty-guard ignores them too).
+  local rows cols
+  read -r rows cols < <(stty size </dev/tty 2>/dev/null)
+  (( ${cols:-0} >= 40 && ${rows:-0} >= 10 )) && cmd="stty rows $rows cols $cols; exec $cmd" || cmd="exec $cmd"
+  _czr_herdr pane run "$pane" "$cmd" >/dev/null || return 1
   echo "$pane"
 }
 
@@ -226,7 +232,6 @@ _czr_herdr_watch() {
     _czr_alive "$3" "$4" || break
     _czr_rows_vanished && gone=$t
     _czr_sync_name "$1"
-    _czr_sync_size "$1"
     [[ -n ${now+x} ]] && prev=$now
   done
   _czr_title_stop
