@@ -41,3 +41,11 @@ herdr --session zedpoc server stop
 - Status is pull, not push.
 - Live PTY: run `herdr` or `herdr agent attach <name>` in Zed's terminal.
 - `herdr_close` kills processes inside the pane — confirm first.
+
+## Run agents from Zed's terminal in Herdr
+
+`shell/zed-autoresume.sh` makes `claude`, `opencode` and every other agent Herdr supports (`kilo`, `codex`, `gemini`, ...) open in a Herdr pane when typed in a Zed terminal. The Zed terminal then attaches to that pane. Bash only. Zed extensions can't hook the shell, so install it separately:
+
+```sh
+echo '[[ -f /path/to/herdr-zed/shell/zed-autoresume.sh ]] && source /path/to/herdr-zed/shell/zed-autoresume.sh' >> ~/.bashrc
+```
