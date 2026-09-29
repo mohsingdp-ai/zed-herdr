@@ -3,6 +3,8 @@
 Zed stays the editor. Herdr owns workspaces, tabs, panes and agents.
 This extension gives Zed's Agent panel a `herdr` MCP server that drives the real `herdr` CLI.
 
+![Herdr threads sidebar with a Claude Code session in Zed](docs/screenshot.png)
+
 ## Tools
 
 - `herdr_status` — workspaces, tabs, panes, git branch, agent status
