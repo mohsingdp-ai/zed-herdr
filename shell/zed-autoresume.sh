@@ -312,12 +312,14 @@ _czr_restore() {
   # Old titles, read before the probe title replaces ours.
   old=$(sqlite3 -readonly "$db" "select terminal_id, title from sidebar_terminal_threads where folder_paths = '${root//\'/\'\'}'" 2>/dev/null)
   # A thread herdr-to-zed just opened: show the agent it queued for this
-  # project. It queues it only as it presses the new-thread key, after Zed has
-  # opened the project, so the terminals Zed restores then don't take it.
-  # mv is atomic, so only one shell takes each. $PWD: a worktree Zed just
-  # opened may not be a saved Zed project yet.
+  # project. Only a sidebar thread takes it: the panel terminal Zed restores
+  # as it opens the project starts about then too. mv is atomic, so only one
+  # shell takes each. $PWD: a worktree Zed just opened may not be a saved Zed
+  # project yet.
   for f in "$CZR_STATE"/show/*; do
-    [[ -f $f ]] && [[ $(<"$f") == "$root" || $(<"$f") == "$PWD" ]] && mv "$f" "$f.$$" 2>/dev/null || continue
+    [[ -f $f ]] && [[ $(<"$f") == "$root" || $(<"$f") == "$PWD" ]] || continue
+    [[ -n $row ]] || row=$(_czr_own_row "$db") || return
+    mv "$f" "$f.$$" 2>/dev/null || continue
     rm -f "$f.$$"
     pane=${f##*/} pane=${pane/_/:}
     _czr_claim "$pane" && { _czr_herdr_attach "$pane"; return; }
@@ -331,7 +333,7 @@ _czr_restore() {
     [[ -d $d ]] && _czr_alive $(cat "$d/owner" 2>/dev/null) || panes+=("$pane")
   done
   (( ${#panes[@]} )) || return
-  row=$(_czr_own_row "$db") || return
+  [[ -n $row ]] || row=$(_czr_own_row "$db") || return
   old=$(sed -n "s/^$row|//p" <<<"$old")
   [[ -n $old ]] || return  # our row isn't one Zed had: not a thread
   for pane in "${panes[@]}"; do
@@ -397,7 +399,7 @@ herdr-to-zed() {
   # ponytail: Hyprland only (hyprctl sends the key); one agent at a time.
   command -v hyprctl >/dev/null && command -v zeditor >/dev/null && command -v jq >/dev/null \
     || { echo "herdr-to-zed: needs hyprctl, zeditor and jq" >&2; return 1; }
-  local db=${CZR_ZED_DB:-~/.local/share/zed/db/0-stable/db.sqlite} pane cwd root name f t win i want="" n=0 z p r c=0
+  local db=${CZR_ZED_DB:-~/.local/share/zed/db/0-stable/db.sqlite} pane cwd root name f t win i want="" n=0 z p r c=0 k
   local -A roots rootof
   local -a todo failed pending KIDS SHELLS
   local ZED_PIDS=""  # Zed's pids, found once (_czr_zed_shells)
@@ -478,17 +480,14 @@ herdr-to-zed() {
       sleep 0.1
     done
     (( i > 1 )) && sleep 1.5
-    # Lua dispatch (Hyprland 0.55+), down/up like Omarchy's own bindings;
-    # older Hyprland takes sendshortcut.
-    # Queue the agent now, as the key goes out (see _czr_restore). The extra
-    # thread Zed opens when it auto-repeats the key is closed at the end.
+    # Queue the agent now, as the key goes out (see _czr_restore).
     _czr_zed_shells; p=" ${SHELLS[*]} "
     printf '%s' "$root" >"$f"
-    if [[ -n $win ]]; then
-      { hyprctl dispatch 'hl.dsp.send_key_state({ mods = "CTRL ALT SHIFT", key = "T", state = "down" })' &&
-        hyprctl dispatch 'hl.dsp.send_key_state({ mods = "CTRL ALT SHIFT", key = "T", state = "up" })'; } >/dev/null 2>&1 ||
-        hyprctl dispatch sendshortcut "CTRL ALT SHIFT, T, address:$win" >/dev/null 2>&1
-    fi
+    # Down and up in one Lua call (Hyprland 0.55+), so up follows at once:
+    # Zed, busy opening the thread, would take a late up for a held key and
+    # repeat it (a second, empty thread).
+    [[ -n $win ]] && hyprctl eval 'for _, s in ipairs({ "down", "up" }) do
+        hl.dispatch(hl.dsp.send_key_state({ mods = "CTRL ALT SHIFT", key = "T", state = s })) end' >/dev/null 2>&1
     # Wait only until Zed has started the thread's shell (or a shell took the
     # agent), then go on: the shells load ~/.bashrc and take their agents in
     # parallel, checked below.
@@ -537,10 +536,19 @@ herdr-to-zed() {
     [[ $p != "$$" && ${#KIDS[@]} == 0 ]] || continue
     [[ -f $CZR_STATE/closable/$p && $(<"$CZR_STATE/closable/$p") == "$(_czr_starttime "$p")" ]] || continue
     r=$(_czr_show_root "$(readlink "/proc/$p/cwd")") && [[ -n $r && -n ${roots[$r]-} ]] || continue
-    # Never in a linked worktree: closing a thread there can make Zed drop
-    # the worktree's whole project, killing the thread that shows the agent,
-    # and _czr_herdr_watch then closes the agent's pane.
-    [[ $(git -C "$r" rev-parse --git-dir 2>/dev/null) == "$(git -C "$r" rev-parse --git-common-dir 2>/dev/null)" ]] || continue
+    # In a linked worktree, Zed drops the whole project when its last thread
+    # closes, killing every terminal in it: keep one showing an agent there.
+    if [[ $(git -C "$r" rev-parse --git-dir 2>/dev/null) != "$(git -C "$r" rev-parse --git-common-dir 2>/dev/null)" ]]; then
+      t=""
+      for z in "${SHELLS[@]}"; do  # a thread attached to an agent (_czr_herdr_attach)
+        [[ $(readlink "/proc/$z/cwd") == "$r" ]] || continue
+        _czr_kids "$z"
+        for k in "${KIDS[@]}"; do
+          read -r k 2>/dev/null <"/proc/$k/comm" && [[ $k == czr-pty-guard || $k == herdr || $k == tmux* ]] && t=1
+        done
+      done
+      [[ -n $t ]] || continue
+    fi
     kill -ALRM "$p" 2>/dev/null && c=$((c + 1))
   done
   (( c == 0 )) || echo "$c empty shell(s) closed"
