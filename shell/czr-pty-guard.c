@@ -43,6 +43,47 @@ static ssize_t take_focus(char *buf, ssize_t n, int *changed) {
     return o;
 }
 
+// Right-click in a Zed thread copies the Herdr pane id it shows (zed-autoresume
+// runs us as "czr-pty-guard herdr agent attach <pane>"). Zed sends clicks here
+// as SGR mouse reports (ESC [ < b ; x ; y M/m) while herdr's attach has mouse
+// capture on; right button presses, releases and drags are dropped, so the
+// agent never sees them.
+// ponytail: wl-copy only (Wayland); a report split across two reads passes through.
+static const char *g_pane;
+
+static void copy_pane_id(void) {
+    if (fork() == 0) {
+        sigset_t none;
+        sigemptyset(&none);
+        sigprocmask(SIG_SETMASK, &none, NULL);
+        setsid();
+        execl("/bin/sh", "sh", "-c",
+              "printf %s \"$0\" | wl-copy && notify-send -a Herdr -t 1500 'Copied pane id' \"$0\"; :"
+              " </dev/null >/dev/null 2>&1", g_pane, (char *)NULL);
+        _exit(127);
+    }
+}
+
+static ssize_t take_right_click(char *buf, ssize_t n) {
+    ssize_t o = 0;
+    for (ssize_t i = 0; i < n; i++) {
+        if (i + 2 < n && buf[i] == '\x1b' && buf[i + 1] == '[' && buf[i + 2] == '<') {
+            ssize_t j = i + 3;
+            int b = 0;
+            while (j < n && buf[j] >= '0' && buf[j] <= '9') b = b * 10 + (buf[j++] - '0');
+            while (j < n && ((buf[j] >= '0' && buf[j] <= '9') || buf[j] == ';')) j++;
+            // b: low 2 bits = button (2 = right), +32 drag, +64 wheel, +4/8/16 modifiers
+            if (j < n && (buf[j] == 'M' || buf[j] == 'm') && (b & 3) == 2 && !(b & 64)) {
+                if (buf[j] == 'M' && !(b & 32)) copy_pane_id();
+                i = j;
+                continue;
+            }
+        }
+        buf[o++] = buf[i];
+    }
+    return o;
+}
+
 // Notes the agent turning focus reports on/off; returns 1 if it turned them
 // off, so the caller turns them back on in Zed (the guard still needs them).
 // ponytail: combined modes ("ESC [?1004;2004h") aren't parsed.
@@ -169,6 +210,8 @@ int main(int argc, char *argv[]) {
     }
 
     g_hook = getenv("CZR_FOCUS_HOOK");
+    for (int i = 1; !g_hook && i + 1 < argc; i++)
+        if (!strcmp(argv[i], "attach")) g_pane = argv[i + 1];
     const char *sizefile = getenv("CZR_SIZE_FILE");
     if (!g_hook && sizefile) {
         snprintf(g_pidfile, sizeof g_pidfile, "%s.pid", sizefile);
@@ -315,6 +358,7 @@ int main(int argc, char *argv[]) {
             ssize_t got = read(STDIN_FILENO, buf, sizeof(buf));
             int changed = 0;
             ssize_t n = got > 0 ? take_focus(buf, got, &changed) : got;
+            if (n > 0 && g_pane) n = take_right_click(buf, n);
             // Typing or clicking into Zed's terminal (or it gaining focus
             // inside Zed) applies a held shrink.
             if (g_hook) {

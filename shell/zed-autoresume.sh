@@ -28,7 +28,8 @@ _czr_pty_guard() {
   local src=${BASH_SOURCE[0]%/*}/czr-pty-guard.c
   if [[ -f $src && ( ! -x $bin || $src -nt $bin ) ]] && command -v gcc >/dev/null; then
     mkdir -p "${bin%/*}"
-    gcc -O2 "$src" -o "$bin" 2>/dev/null
+    # Build beside it and swap in: running guards keep the old file open.
+    gcc -O2 "$src" -o "$bin.$$" 2>/dev/null && mv -f "$bin.$$" "$bin"
   fi
   if [[ -x $bin ]]; then
     "$bin" herdr ${CZR_HERDR_SESSION:+--session "$CZR_HERDR_SESSION"} "$@"
@@ -282,20 +283,37 @@ _czr_claim() {
   return 1
 }
 
+_czr_own_row() {
+  # db - prints this shell's Zed sidebar row: sets a unique title and waits for
+  # a row to take it. Zed also runs panel/editor terminals, identical from
+  # inside; those get no row, so this fails for them.
+  local probe="· czr-$$-$RANDOM" row i
+  for i in {1..40}; do
+    # To the terminal: stdout is the caller's $(...). Again each time,
+    # alternating so it changes: at Zed's start a thread's shell can run
+    # before Zed listens to its title, and one set early would be missed.
+    printf '\e]0;%s\a' "$probe$(( i % 2 ? 1 : 2 ))" >/dev/tty
+    row=$(sqlite3 -readonly "$1" "select terminal_id from sidebar_terminal_threads where title in ('${probe}1', '${probe}2')" 2>/dev/null)
+    [[ -n $row ]] && { echo "$row"; return; }
+    sleep 0.1
+  done
+  return 1
+}
+
 _czr_restore() {
-  # After a Zed restart, Zed reopens its threads as plain shells. Each Zed row
-  # still titled with our status line (braille spinner, ✘, ✓, ● or ·;
-  # ◯/○/✗/❌/×, ◐◓◑◒ and ✢/🔴 are older ones) was showing a Herdr agent.
-  # Zed also reopens panel/editor terminals, identical from inside, so this
-  # shell first finds its own sidebar row: it sets a unique title and waits for
-  # a row to take it. No row = not a thread, attach nothing. The row's old
-  # title names the agent it showed (last.<pane>, kept by _czr_herdr_watch);
-  # an unknown agent title falls back to any of the project's unshown agents.
+  # After a Zed restart, Zed reopens its threads as plain shells. A sidebar
+  # thread (_czr_own_row) in a project with a Herdr agent no Zed terminal shows
+  # takes it: the one its old title names (last.<pane>, kept by
+  # _czr_herdr_watch), else any. Not by title alone: Zed saves titles lazily,
+  # so a thread made shortly before a restart comes back with its shell's.
   [[ ${CZR_HERDR:-1} != 0 ]] && command -v herdr >/dev/null && command -v jq >/dev/null || return
-  local db=${CZR_ZED_DB:-~/.local/share/zed/db/0-stable/db.sqlite} root r ours rows live=0 d pane panes f
-  local probe="· czr-$$-$RANDOM" row="" old i
+  local db=${CZR_ZED_DB:-~/.local/share/zed/db/0-stable/db.sqlite} root d pane panes=() f row old
   root=$(_czr_project)
-  # A terminal herdr-to-zed opened: show the agent it queued for this project.
+  # Old titles, read before the probe title replaces ours.
+  old=$(sqlite3 -readonly "$db" "select terminal_id, title from sidebar_terminal_threads where folder_paths = '${root//\'/\'\'}'" 2>/dev/null)
+  # A thread herdr-to-zed just opened: show the agent it queued for this
+  # project. It queues it only as it presses the new-thread key, after Zed has
+  # opened the project, so the terminals Zed restores then don't take it.
   # mv is atomic, so only one shell takes each. $PWD: a worktree Zed just
   # opened may not be a saved Zed project yet.
   for f in "$CZR_STATE"/show/*; do
@@ -304,44 +322,22 @@ _czr_restore() {
     pane=${f##*/} pane=${pane/_/:}
     _czr_claim "$pane" && { _czr_herdr_attach "$pane"; return; }
   done
-  # A second thread from that same key press: Zed is busy opening the first one
-  # past the key-repeat delay, so it repeats the key. Exiting 0 closes the thread.
-  # ponytail: a thread opened by hand in this project within 5s closes too.
-  f=$CZR_STATE/opening
-  [[ -f $f ]] && [[ $(<"$f") == "$root" || $(<"$f") == "$PWD" ]] &&
-    (( $(printf '%(%s)T') - $(stat -c %Y "$f") < 5 )) && exit 0
-  r=${root//\'/\'\'}
-  # unicode() range: the czr-status font's icons (U+100000-U+10001F).
-  ours="folder_paths = '$r' and (unicode(title) between 1048576 and 1048607 or substr(title, 1, 2) in
-    ('⣾ ', '⣽ ', '⣻ ', '⢿ ', '⡿ ', '⣟ ', '⣯ ', '⣷ ',
-     '⠋ ', '⠙ ', '⠹ ', '⠸ ', '⠼ ', '⠴ ', '⠦ ', '⠧ ', '⠇ ', '⠏ ',
-     '✘ ', '✗ ', '❌ ', '◯ ', '○ ', '◐ ', '◓ ', '◑ ', '◒ ', '× ', '✓ ', '· ',
-     '✢ ', '✳ ', '✶ ', '✻ ', '✽ ', '❌ ', '● ', '🔴 '))"
-  rows=$(sqlite3 -readonly "$db" "select count(*) from sidebar_terminal_threads where $ours" 2>/dev/null)
-  (( ${rows:-0} > 0 )) || return
-  # The project's agents: those running in its folder (herdr cuts long
-  # workspace tokens, so not matched by zd_project).
-  panes=$(_czr_herdr agent list 2>/dev/null | jq -r --arg r "$root" \
-    '.result.agents[] | select(.cwd == $r or (.cwd | startswith($r + "/"))) | .pane_id')
-  for pane in $panes; do
+  [[ -n $old ]] || return  # no threads here before this shell
+  # The project's agents no Zed terminal shows: those running in its folder
+  # (herdr cuts long workspace tokens, so not matched by zd_project).
+  for pane in $(_czr_herdr agent list 2>/dev/null | jq -r --arg r "$root" \
+      '.result.agents[] | select(.cwd == $r or (.cwd | startswith($r + "/"))) | .pane_id'); do
     d=$CZR_STATE/claims/${pane//:/_}
-    [[ -d $d ]] && _czr_alive $(cat "$d/owner" 2>/dev/null) && live=$((live + 1))
+    [[ -d $d ]] && _czr_alive $(cat "$d/owner" 2>/dev/null) || panes+=("$pane")
   done
-  (( rows > live )) || return
-  old=$(sqlite3 -readonly "$db" "select terminal_id, title from sidebar_terminal_threads where $ours" 2>/dev/null)
-  printf '\e]0;%s\a' "$probe"
-  for i in {1..40}; do
-    row=$(sqlite3 -readonly "$db" "select terminal_id from sidebar_terminal_threads where title = '$probe'" 2>/dev/null)
-    [[ -n $row ]] && break
-    sleep 0.1
-  done
-  [[ -n $row ]] || return
+  (( ${#panes[@]} )) || return
+  row=$(_czr_own_row "$db") || return
   old=$(sed -n "s/^$row|//p" <<<"$old")
-  [[ -n $old ]] || return  # our row wasn't showing an agent
-  for pane in $panes; do
+  [[ -n $old ]] || return  # our row isn't one Zed had: not a thread
+  for pane in "${panes[@]}"; do
     [[ $(cat "$CZR_STATE/last.${pane//:/_}" 2>/dev/null) == "$old" ]] && _czr_claim "$pane" && { _czr_herdr_attach "$pane"; return; }
   done
-  for pane in $panes; do
+  for pane in "${panes[@]}"; do
     _czr_claim "$pane" && { _czr_herdr_attach "$pane"; return; }
   done
 }
@@ -364,6 +360,31 @@ _czr_zeditor() {
   env $(compgen -e | grep -E '^(HERDR_|CLAUDE)' | sed 's/^/-u /') zeditor "$@"
 }
 
+_czr_kids() {
+  # pid - sets KIDS to its child pids, from the kernel's list: no pgrep (it
+  # scans all of /proc) and no subshells, as herdr-to-zed asks often.
+  local f k
+  KIDS=()
+  for f in /proc/"$1"/task/*/children; do
+    k=()
+    read -r -a k 2>/dev/null <"$f"  # fails at the missing final newline, still reads
+    KIDS+=("${k[@]}")
+  done
+}
+
+_czr_zed_shells() {
+  # Sets SHELLS to the pids of the shells Zed runs (its terminals).
+  local z p c
+  SHELLS=()
+  [[ -n ${ZED_PIDS:-} ]] || ZED_PIDS=$(pidof zed-editor)  # herdr-to-zed resets it per run
+  for z in $ZED_PIDS; do
+    _czr_kids "$z"
+    for p in "${KIDS[@]}"; do
+      read -r c 2>/dev/null <"/proc/$p/comm" && [[ $c == bash ]] && SHELLS+=("$p")
+    done
+  done
+}
+
 herdr-to-zed() {
   # [project-dir] - show every Herdr agent (of that project only, if given; "."
   # = this one) that no Zed terminal shows yet: open its project in Zed,
@@ -378,22 +399,33 @@ herdr-to-zed() {
     || { echo "herdr-to-zed: needs hyprctl, zeditor and jq" >&2; return 1; }
   local db=${CZR_ZED_DB:-~/.local/share/zed/db/0-stable/db.sqlite} pane cwd root name f t win i want="" n=0 z p r c=0
   local -A roots rootof
+  local -a todo failed pending KIDS SHELLS
+  local ZED_PIDS=""  # Zed's pids, found once (_czr_zed_shells)
+  local pass
   if [[ -n ${1:-} ]]; then
     want=$(_czr_show_root "$1") || { echo "herdr-to-zed: no such directory: $1" >&2; return 1; }
   fi
   mkdir -p "$CZR_STATE/show"
   while IFS=$'\t' read -r pane cwd; do
-    root=$(_czr_show_root "$cwd") || continue
+    # The project it was last shown in (_czr_herdr_attach), even if since
+    # removed from Zed: else Zed's nearest known folder could be a parent.
+    root=$(cat "$CZR_STATE/root.${pane//:/_}" 2>/dev/null)
+    [[ -d $root ]] || root=$(_czr_show_root "$cwd") || continue
     [[ -z $want || $root == "$want" ]] || continue
     roots[$root]=1 rootof[$pane]=$root
   done < <(_czr_herdr agent list | jq -r '.result.agents[] | [.pane_id, .cwd] | @tsv')
-  if (( ${#roots[@]} )) && ! pgrep -x zed-editor >/dev/null; then
+  if (( ${#roots[@]} )) && ! pidof zed-editor >/dev/null; then
     t=""
     for r in "${!roots[@]}"; do t+="${t:+,}'${r//\'/\'\'}'"; done
     sqlite3 "$db" "delete from sidebar_terminal_threads where custom_title is null and folder_paths in ($t); select changes()" |
       { read -r c; (( c == 0 )) || echo "dropped $c saved Zed thread(s)"; }
   fi
-  for pane in "${!rootof[@]}"; do
+  # Two passes: a project Zed has to load afresh (e.g. one just removed from
+  # it) can take longer than the waits below; the second pass finds it ready.
+  todo=("${!rootof[@]}")
+  for pass in 1 2; do
+  failed=() pending=()
+  for pane in "${todo[@]}"; do
     root=${rootof[$pane]}
     f=$CZR_STATE/claims/${pane//:/_}
     [[ -d $f ]] && _czr_alive $(cat "$f/owner" 2>/dev/null) && continue
@@ -403,13 +435,29 @@ herdr-to-zed() {
     # thread, open the project and wait for it instead of adding a thread.
     # Compares after the first space: the leading glyph may be another frame.
     t=$(cat "$CZR_STATE/last.${pane//:/_}" 2>/dev/null) t=${t#* }
+    # A shell already running in the project: Zed has started its threads, so
+    # none will reattach on opening it. Straight to a new thread.
+    _czr_zed_shells
+    for z in "${SHELLS[@]}"; do [[ $(readlink "/proc/$z/cwd") == "$root"* ]] && t=""; done
     if [[ -n $t ]] && (( $(sqlite3 -readonly "$db" "select count(*) from sidebar_terminal_threads
         where folder_paths = '${root//\'/\'\'}' and substr(title, instr(title, ' ') + 1) = '${t//\'/\'\'}'" 2>/dev/null || echo 0) > 0 )); then
+      # Its shell starts as the project opens, if it isn't running already
+      # (then it won't reattach). No new shell there soon: add a thread instead.
+      _czr_zed_shells; p=" ${SHELLS[*]} "
       _czr_zeditor "$root" >/dev/null 2>&1
       f=$CZR_STATE/claims/${pane//:/_}
-      for i in {1..40}; do
+      for i in {1..80}; do
         [[ -d $f ]] && _czr_alive $(cat "$f/owner" 2>/dev/null) && break
-        sleep 0.25
+        if (( i == 30 )); then  # 1.5s: did Zed start a shell in the project?
+          z=""
+          _czr_zed_shells
+          for z in "${SHELLS[@]}"; do
+            [[ $p != *" $z "* && $(readlink "/proc/$z/cwd") == "$root"* ]] && break
+            z=""
+          done
+          [[ -n $z ]] || break
+        fi
+        sleep 0.05
       done
       if [[ -d $f ]] && _czr_alive $(cat "$f/owner" 2>/dev/null); then
         echo "$pane -> $name (its thread)"
@@ -418,8 +466,6 @@ herdr-to-zed() {
       fi
     fi
     f=$CZR_STATE/show/${pane//:/_}
-    printf '%s' "$root" >"$f"
-    printf '%s' "$root" >"$CZR_STATE/opening"
     _czr_zeditor "$root" >/dev/null 2>&1
     # Zed's window title starts with the project name once it has focus.
     # Just switched to it: give Zed a moment to load the project, or the new
@@ -434,21 +480,49 @@ herdr-to-zed() {
     (( i > 1 )) && sleep 1.5
     # Lua dispatch (Hyprland 0.55+), down/up like Omarchy's own bindings;
     # older Hyprland takes sendshortcut.
+    # Queue the agent now, as the key goes out (see _czr_restore). The extra
+    # thread Zed opens when it auto-repeats the key is closed at the end.
+    _czr_zed_shells; p=" ${SHELLS[*]} "
+    printf '%s' "$root" >"$f"
     if [[ -n $win ]]; then
       { hyprctl dispatch 'hl.dsp.send_key_state({ mods = "CTRL ALT SHIFT", key = "T", state = "down" })' &&
         hyprctl dispatch 'hl.dsp.send_key_state({ mods = "CTRL ALT SHIFT", key = "T", state = "up" })'; } >/dev/null 2>&1 ||
         hyprctl dispatch sendshortcut "CTRL ALT SHIFT, T, address:$win" >/dev/null 2>&1
     fi
-    for i in {1..100}; do [[ -e $f ]] || break; sleep 0.1; done
+    # Wait only until Zed has started the thread's shell (or a shell took the
+    # agent), then go on: the shells load ~/.bashrc and take their agents in
+    # parallel, checked below.
+    for i in {1..100}; do
+      [[ -e $f ]] || break
+      _czr_zed_shells
+      for z in "${SHELLS[@]}"; do
+        [[ $p != *" $z "* && $(readlink "/proc/$z/cwd") == "$root"* ]] && break 2
+      done
+      sleep 0.02
+    done
+    pending+=("$pane")
+  done
+  for i in {1..200}; do
+    t=""
+    for pane in "${pending[@]}"; do [[ -e $CZR_STATE/show/${pane//:/_} ]] && t=1; done
+    [[ -n $t ]] || break
+    sleep 0.05
+  done
+  for pane in "${pending[@]}"; do
+    f=$CZR_STATE/show/${pane//:/_} name=${rootof[$pane]##*/}
     if [[ -e $f ]]; then
       rm -f "$f"
-      echo "! $pane ($name): no Zed terminal picked it up" >&2
+      failed+=("$pane")
+      (( pass == 1 )) || echo "! $pane ($name): no Zed terminal picked it up" >&2
     else
       # Taken by the new thread, or by an old one of the project that Zed
       # started when the project opened.
       echo "$pane -> $name"
       n=$((n + 1))
     fi
+  done
+  (( ${#failed[@]} )) || break
+  todo=("${failed[@]}")
   done
   echo "$n agent(s) now shown in Zed"
   # Idle = nothing running in it. Only shells that set the ALRM trap below
@@ -457,13 +531,17 @@ herdr-to-zed() {
   for f in "$CZR_STATE"/closable/*; do
     [[ -f $f ]] && ! _czr_alive "${f##*/}" "$(<"$f")" && rm -f "$f"
   done
-  for z in $(pgrep -x zed-editor); do
-    for p in $(pgrep -P "$z" -x bash); do
-      [[ $p != "$$" ]] && ! pgrep -P "$p" >/dev/null || continue
-      [[ -f $CZR_STATE/closable/$p && $(<"$CZR_STATE/closable/$p") == "$(_czr_starttime "$p")" ]] || continue
-      r=$(_czr_show_root "$(readlink "/proc/$p/cwd")") && [[ -n $r && -n ${roots[$r]-} ]] || continue
-      kill -ALRM "$p" 2>/dev/null && c=$((c + 1))
-    done
+  _czr_zed_shells
+  for p in "${SHELLS[@]}"; do
+    _czr_kids "$p"
+    [[ $p != "$$" && ${#KIDS[@]} == 0 ]] || continue
+    [[ -f $CZR_STATE/closable/$p && $(<"$CZR_STATE/closable/$p") == "$(_czr_starttime "$p")" ]] || continue
+    r=$(_czr_show_root "$(readlink "/proc/$p/cwd")") && [[ -n $r && -n ${roots[$r]-} ]] || continue
+    # Never in a linked worktree: closing a thread there can make Zed drop
+    # the worktree's whole project, killing the thread that shows the agent,
+    # and _czr_herdr_watch then closes the agent's pane.
+    [[ $(git -C "$r" rev-parse --git-dir 2>/dev/null) == "$(git -C "$r" rev-parse --git-common-dir 2>/dev/null)" ]] || continue
+    kill -ALRM "$p" 2>/dev/null && c=$((c + 1))
   done
   (( c == 0 )) || echo "$c empty shell(s) closed"
 }
@@ -472,6 +550,7 @@ _czr_herdr_attach() {
   # Wait for Herdr to detect the agent, then show its live terminal here.
   local i rc t zpid wp
   mkdir -p "$CZR_STATE"
+  _czr_project >"$CZR_STATE/root.${1//:/_}"  # where it's shown, for herdr-to-zed
   _czr_claim "$1"
   for i in {1..40}; do
     _czr_herdr agent get "$1" >/dev/null 2>&1 && break
