@@ -37,6 +37,17 @@ _czr_pty_guard() {
   fi
 }
 
+_czr_status_font() {
+  # Installs czr-status.ttf (status icons in Herdr's colors, built by
+  # czr-status-font.py) for Zed; succeeds once it's installed. Zed loads fonts
+  # when it starts, so it needs one restart to show them.
+  local src=${BASH_SOURCE[0]%/*}/czr-status.ttf dst=${XDG_DATA_HOME:-~/.local/share}/fonts/czr-status.ttf
+  if [[ -f $src && ( ! -f $dst || $src -nt $dst ) ]]; then
+    mkdir -p "${dst%/*}" && cp "$src" "$dst" && fc-cache -f "${dst%/*}" >/dev/null 2>&1
+  fi
+  [[ -f $dst ]]
+}
+
 herdr() {
   # A plain `herdr` (the TUI, outside Zed and Herdr) runs inside czr-pty-guard,
   # which sees its terminal's focus-in and resize events and then gives every
@@ -117,7 +128,7 @@ _czr_sync_name() {
   if [[ -n $named ]]; then
     want=$named
   else
-    # t is "<glyph> <task>" (working, idle) or "<glyph> <status> · <task>".
+    # t is "<glyph> <task>" (unknown status: "<glyph> unknown · <task>").
     want=${t#* }
     case $want in
       blocked\ ·\ *|done\ ·\ *|idle\ ·\ *|unknown\ ·\ *) want=${want#* · } ;;
@@ -137,8 +148,8 @@ _czr_herdr_watch() {
   # sidebar shows as the thread name. Herdr's attach doesn't forward titles, so
   # this listens to the server's own push stream (events.subscribe on the session
   # socket, same events Herdr's clients render from). While the agent works the
-  # title is a spinning braille spinner + the pane name, idle is "● <pane name>";
-  # other states show "<glyph> <status> · <pane name>". The pane name is what the user named it in
+  # title is a spinning braille spinner + the pane name, other states the icon + the pane name;
+  # unknown shows "<glyph> unknown · <pane name>". The pane name is what the user named it in
   # Herdr (else the agent's name); a pane without a name falls back to the
   # agent's task title. USR1 (sent when attach ends) stops the title.
   # ponytail: writes the tty alongside attach; a write can land mid-frame
@@ -158,7 +169,14 @@ _czr_herdr_watch() {
   local sock status="" title="" agent="" aname="" pname="" line ev g cur rc shown="" fi=0
   local sfile=$CZR_STATE/size.${1//:/_}
   SUB_PID=""  # set by coproc; not local, coproc assigns it globally
-  local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)  # braille spinner while working
+  # Status icons: gray text symbols, or with the czr-status font installed
+  # its colored ones (green ring idle, yellow spinner working, red ✕ blocked,
+  # teal ✓ done; code points as in czr-status-font.py).
+  local frames=(⣾ ⣽ ⣻ ⢿ ⡿ ⣟ ⣯ ⣷) i_idle=● i_blocked=✘ i_done=✓ i_unknown=·
+  if _czr_status_font; then
+    frames=($'\U00100010' $'\U00100011' $'\U00100012' $'\U00100013' $'\U00100014' $'\U00100015' $'\U00100016' $'\U00100017')
+    i_idle=$'\U00100000' i_blocked=$'\U00100001' i_done=$'\U00100002' i_unknown=$'\U00100003'
+  fi
   local tfile=$CZR_STATE/title.${1//:/_}
   _czr_rows_vanished() { now=$(sqlite3 -readonly "$db" "$q") && [[ -n $prev ]] && grep -qvxF -f <(printf '%s\n' "$now") <<<"$prev"; }
   _czr_title_stop() { [[ -n $SUB_PID ]] && kill "$SUB_PID"; SUB_PID=""; rm -f "$tfile"; }
@@ -187,13 +205,13 @@ _czr_herdr_watch() {
     if [[ -n $SUB_PID ]]; then
       case $status in
         working) g=${frames[fi]} ;;
-        blocked) g=✘ ;;  # heavy ballot X: the ✗ cross, bold
-        done) g=✓ ;;
-        idle) g=● ;;  # filled: Zed draws this glyph faint gray, a ring looked too light
-        *) g=· ;;
+        blocked) g=$i_blocked ;;
+        done) g=$i_done ;;
+        idle) g=$i_idle ;;
+        *) g=$i_unknown ;;
       esac
-      if [[ $status == working || $status == idle ]]; then
-        cur="$g ${pname:-${title:-$agent}}"  # the glyph alone says working/idle
+      if [[ $status == working || $status == idle || $status == blocked || $status == done ]]; then
+        cur="$g ${pname:-${title:-$agent}}"  # the icon alone says the status
       else
         cur="$g ${status:-unknown} · ${pname:-${title:-$agent}}"
       fi
@@ -293,10 +311,12 @@ _czr_restore() {
   [[ -f $f ]] && [[ $(<"$f") == "$root" || $(<"$f") == "$PWD" ]] &&
     (( $(printf '%(%s)T') - $(stat -c %Y "$f") < 5 )) && exit 0
   r=${root//\'/\'\'}
-  ours="folder_paths = '$r' and substr(title, 1, 2) in
-    ('⠋ ', '⠙ ', '⠹ ', '⠸ ', '⠼ ', '⠴ ', '⠦ ', '⠧ ', '⠇ ', '⠏ ',
+  # unicode() range: the czr-status font's icons (U+100000-U+10001F).
+  ours="folder_paths = '$r' and (unicode(title) between 1048576 and 1048607 or substr(title, 1, 2) in
+    ('⣾ ', '⣽ ', '⣻ ', '⢿ ', '⡿ ', '⣟ ', '⣯ ', '⣷ ',
+     '⠋ ', '⠙ ', '⠹ ', '⠸ ', '⠼ ', '⠴ ', '⠦ ', '⠧ ', '⠇ ', '⠏ ',
      '✘ ', '✗ ', '❌ ', '◯ ', '○ ', '◐ ', '◓ ', '◑ ', '◒ ', '× ', '✓ ', '· ',
-     '✢ ', '✳ ', '✶ ', '✻ ', '✽ ', '❌ ', '● ', '🔴 ')"
+     '✢ ', '✳ ', '✶ ', '✻ ', '✽ ', '❌ ', '● ', '🔴 '))"
   rows=$(sqlite3 -readonly "$db" "select count(*) from sidebar_terminal_threads where $ours" 2>/dev/null)
   (( ${rows:-0} > 0 )) || return
   # The project's agents: those running in its folder (herdr cuts long
