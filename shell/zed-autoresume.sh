@@ -5,7 +5,8 @@
 # the PTY and agent status) and the Zed terminal just attaches to it. Closing
 # the Zed thread closes the pane; quitting Zed keeps the agent running in
 # Herdr, and the threads Zed restores reattach to those agents (_czr_restore).
-# Renaming the Zed thread renames the Herdr pane. CZR_HERDR=0 disables this.
+# A thread shows its pane's name, and renaming the Zed thread renames the Herdr
+# tab and pane. CZR_HERDR=0 disables this.
 
 CZR_STATE=${XDG_STATE_HOME:-~/.local/state}/zed-herdr
 
@@ -95,8 +96,9 @@ _czr_sync_name() {
   # title matches what _czr_herdr_watch wrote, ignoring the animated first glyph),
   # copies a rename done in
   # Zed (custom_title) onto the Herdr pane, and names the Herdr tab what Zed
-  # shows: that rename, else the agent's task title. Herdr notifications name
-  # the tab, so they then match the Zed thread. Uses _czr_herdr_watch's db/tid/named/tab/tabbed.
+  # shows: that rename, else the pane name (the agent's task title when the pane
+  # has no name). Herdr notifications name
+  # the tab, so they then match the Zed thread. Uses _czr_herdr_watch's db/tid/named/pname/tab/tabbed.
   local t ct want
   t=$(cat "$CZR_STATE/title.${1//:/_}" 2>/dev/null)
   if [[ -z $tid && -n $t ]]; then
@@ -110,7 +112,7 @@ _czr_sync_name() {
   if [[ -n $tid ]] && ct=$(sqlite3 -readonly "$db" "select coalesce(custom_title, '') from sidebar_terminal_threads where terminal_id = '$tid'") && [[ $ct != "$named" ]]; then
     # Empty only after a Zed name existed: Zed's name was cleared, clear Herdr's too.
     if [[ -n $ct ]]; then _czr_herdr pane rename "$1" "$ct"; else _czr_herdr pane rename "$1" --clear; fi >/dev/null
-    named=$ct
+    named=$ct pname=$ct
   fi
   if [[ -n $named ]]; then
     want=$named
@@ -135,8 +137,10 @@ _czr_herdr_watch() {
   # sidebar shows as the thread name. Herdr's attach doesn't forward titles, so
   # this listens to the server's own push stream (events.subscribe on the session
   # socket, same events Herdr's clients render from). While the agent works the
-  # title is a spinning braille spinner + the task title; other states show
-  # "<glyph> <status> · <task>". USR1 (sent when attach ends) stops the title.
+  # title is a spinning braille spinner + the pane name; other states show
+  # "<glyph> <status> · <pane name>". The pane name is what the user named it in
+  # Herdr (else the agent's name); a pane without a name falls back to the
+  # agent's task title. USR1 (sent when attach ends) stops the title.
   # ponytail: writes the tty alongside attach; a write can land mid-frame
   # (one-frame glitch). Upgrade: Herdr forwarding titles to attach clients.
   #
@@ -151,7 +155,7 @@ _czr_herdr_watch() {
   exec >/dev/null 2>&1 </dev/null
   local db=${CZR_ZED_DB:-~/.local/share/zed/db/0-stable/db.sqlite} prev="" now i gone=0 tid="" named="" tab="" tabbed=""
   local q="select terminal_id from sidebar_terminal_threads" tick=0 t
-  local sock status="" title="" agent="" line ev g cur rc shown="" fi=0
+  local sock status="" title="" agent="" aname="" pname="" line ev g cur rc shown="" fi=0
   local sfile=$CZR_STATE/size.${1//:/_}
   SUB_PID=""  # set by coproc; not local, coproc assigns it globally
   local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)  # braille spinner while working
@@ -168,8 +172,13 @@ _czr_herdr_watch() {
       jq -nc --arg p "$1" '{id: "zed-title", method: "events.subscribe", params: {subscriptions: [
         {type: "pane.agent_status_changed", pane_id: $p}, {type: "pane.updated"}, {type: "pane.closed"}]}}' >&"${SUB[1]}"
       # Subscribe first, then read current state, so no change falls in between.
-      IFS=$'\t' read -r status agent title < <(_czr_herdr agent get "$1" |
-        jq -r '.result.agent | [.agent_status, .agent // "agent", .terminal_title_stripped // ""] | @tsv')
+      IFS=$'\t' read -r status agent title aname < <(_czr_herdr agent get "$1" |
+        jq -r '.result.agent | [.agent_status, .agent // "agent", .terminal_title_stripped // "", .name // ""] | @tsv')
+      # The pane name: what it was renamed to in Herdr, else the agent's name.
+      # It names this thread, so a thread restored to a named pane comes back
+      # as that pane.
+      IFS= read -r pname < <(_czr_herdr pane get "$1" | jq -r '.result.pane.label // ""')
+      [[ -n $pname ]] || pname=$aname
     fi
   fi
   # Watch for our shell dying; note when any thread row vanishes (Zed may delete
@@ -184,9 +193,9 @@ _czr_herdr_watch() {
         *) g=· ;;
       esac
       if [[ $status == working ]]; then
-        cur="$g ${title:-$agent}"  # spinner instead of the word "working"
+        cur="$g ${pname:-${title:-$agent}}"  # spinner instead of the word "working"
       else
-        cur="$g ${status:-unknown} · ${title:-$agent}"
+        cur="$g ${status:-unknown} · ${pname:-${title:-$agent}}"
       fi
       if [[ $cur != "$shown" ]]; then
         printf '\e]0;%s\a' "$cur" >"$2"
